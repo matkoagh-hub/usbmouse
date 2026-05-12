@@ -35,6 +35,7 @@
 #include <Update.h>
 #include <WiFiManager.h>
 #include <ArduinoJson.h>
+#include <LittleFS.h>
 #include <USB.h>
 #include <USBHIDMouse.h>
 #include <USBHIDKeyboard.h>
@@ -44,7 +45,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Zvýš pri každom release pushnutom na GitHub (semver "major.minor.patch")
-#define FIRMWARE_VERSION       "1.0.1"
+#define FIRMWARE_VERSION       "1.0.2"
 
 // GitHub repo odkiaľ sa sťahujú aktualizácie
 #define GITHUB_REPO            "matkoagh-hub/usbmouse"
@@ -308,6 +309,174 @@ static void ensureWiFi() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Makrá – záznam a prehrávanie sekvencie HID akcií
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static volatile bool macroRunning       = false;
+static volatile bool macroStopRequested = false;
+static String        currentMacroJson;            // držaný kým beží task
+static TaskHandle_t  macroTaskHandle    = nullptr;
+
+// Pomocné funkcie keyFromName / modifierFromName sú definované nižšie pri WebUI
+
+// Forward decl
+static uint8_t keyFromName(const String& n);
+static uint8_t modifierFromName(const String& n);
+
+// Vykoná jeden krok makra
+static void executeStep(JsonObject step) {
+    const char* a = step["a"] | "";
+
+    if (!strcmp(a, "type")) {
+        const char* t = step["t"] | "";
+        kb_print(t);
+    }
+    else if (!strcmp(a, "key")) {
+        uint8_t code = keyFromName(String(step["k"] | ""));
+        if (code) kb_tap(code);
+    }
+    else if (!strcmp(a, "combo")) {
+        uint8_t mod  = modifierFromName(String(step["m"] | ""));
+        uint8_t code = keyFromName(String(step["k"] | ""));
+        if (mod && code) kb_combo(mod, code);
+    }
+    else if (!strcmp(a, "move")) {
+        int x = constrain((int)(step["x"] | 0), -127, 127);
+        int y = constrain((int)(step["y"] | 0), -127, 127);
+        mouse_move((int8_t)x, (int8_t)y);
+    }
+    else if (!strcmp(a, "click")) {
+        const char* b = step["b"] | "left";
+        uint8_t btn = MOUSE_LEFT;
+        if (!strcmp(b, "right"))  btn = MOUSE_RIGHT;
+        if (!strcmp(b, "middle")) btn = MOUSE_MIDDLE;
+        mouse_click(btn);
+    }
+    else if (!strcmp(a, "scroll")) {
+        int d = constrain((int)(step["d"] | 0), -127, 127);
+        mouse_scroll((int8_t)d);
+    }
+    else if (!strcmp(a, "wait")) {
+        unsigned long ms = step["ms"] | 0UL;
+        unsigned long start = millis();
+        while (millis() - start < ms) {
+            if (macroStopRequested) return;
+            delay(20);  // kontroluj stop každých 20 ms
+        }
+    }
+}
+
+// FreeRTOS task – prehrá makro asynchrónne, aby webserver nezamrzol
+static void macroTaskFunc(void*) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, currentMacroJson);
+
+    if (!err && doc.is<JsonArray>()) {
+        JsonArray arr = doc.as<JsonArray>();
+        Serial.printf("[Macro] Spúšťam %u krokov\n", (unsigned)arr.size());
+
+        int i = 0;
+        for (JsonObject step : arr) {
+            if (macroStopRequested) {
+                Serial.printf("[Macro] Zastavené pri kroku %d\n", i);
+                break;
+            }
+            Serial.printf("[Macro] Krok %d: %s\n", i, step["a"] | "?");
+            executeStep(step);
+            i++;
+            delay(15);  // krátka pauza medzi krokmi (HID nepretečie buffer)
+        }
+        Serial.println("[Macro] Hotovo");
+    } else {
+        Serial.printf("[Macro] Chyba parsovania JSON: %s\n", err.c_str());
+    }
+
+    currentMacroJson    = "";
+    macroRunning        = false;
+    macroStopRequested  = false;
+    macroTaskHandle     = nullptr;
+    vTaskDelete(nullptr);
+}
+
+static bool macro_start(const String& json) {
+    if (macroRunning) return false;
+    currentMacroJson    = json;
+    macroRunning        = true;
+    macroStopRequested  = false;
+
+    BaseType_t r = xTaskCreate(macroTaskFunc, "macro", 8192, nullptr, 1, &macroTaskHandle);
+    if (r != pdPASS) {
+        currentMacroJson = "";
+        macroRunning     = false;
+        return false;
+    }
+    return true;
+}
+
+// ── Storage v LittleFS: /macros/<name>.json (obsah = JSON array krokov) ────
+
+static bool macro_name_valid(const String& n) {
+    if (n.isEmpty() || n.length() > 40) return false;
+    for (size_t i = 0; i < n.length(); i++) {
+        char c = n[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '-' || c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static bool macro_save(const String& name, const String& stepsJson) {
+    if (!macro_name_valid(name)) return false;
+    if (!LittleFS.exists("/macros")) LittleFS.mkdir("/macros");
+    File f = LittleFS.open("/macros/" + name + ".json", "w");
+    if (!f) return false;
+    f.print(stepsJson);
+    f.close();
+    return true;
+}
+
+static String macro_load(const String& name) {
+    if (!macro_name_valid(name)) return "";
+    File f = LittleFS.open("/macros/" + name + ".json", "r");
+    if (!f) return "";
+    String s = f.readString();
+    f.close();
+    return s;
+}
+
+static bool macro_delete(const String& name) {
+    if (!macro_name_valid(name)) return false;
+    return LittleFS.remove("/macros/" + name + ".json");
+}
+
+static String macro_list_json() {
+    String result = "[";
+    File dir = LittleFS.open("/macros");
+    if (dir && dir.isDirectory()) {
+        bool first = true;
+        File f = dir.openNextFile();
+        while (f) {
+            String n = f.name();
+            // f.name() môže vrátiť absolútnu cestu alebo len meno – orež
+            int slash = n.lastIndexOf('/');
+            if (slash >= 0) n = n.substring(slash + 1);
+            if (n.endsWith(".json")) {
+                n = n.substring(0, n.length() - 5);
+                if (!first) result += ',';
+                result += '"';
+                result += n;
+                result += '"';
+                first = false;
+            }
+            f = dir.openNextFile();
+        }
+    }
+    result += "]";
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Web UI – ovládanie HID cez prehliadač
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -321,54 +490,76 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 <title>ESP32 Remote HID</title>
 <style>
   *{box-sizing:border-box}
-  body{font-family:-apple-system,system-ui,sans-serif;max-width:520px;margin:0 auto;padding:16px;background:#f0f2f5;color:#222}
-  h1{font-size:20px;margin:0 0 16px}
-  h2{font-size:14px;margin:0 0 8px;color:#555;text-transform:uppercase;letter-spacing:.5px}
-  .card{background:#fff;border-radius:12px;padding:16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
-  input[type=text]{width:100%;padding:12px;font-size:16px;border:1px solid #ddd;border-radius:8px;margin-bottom:8px}
-  button{padding:10px 14px;font-size:15px;border:none;border-radius:8px;background:#007aff;color:#fff;cursor:pointer;margin:3px}
+  body{font-family:-apple-system,system-ui,sans-serif;max-width:560px;margin:0 auto;padding:14px;background:#f0f2f5;color:#222}
+  h1{font-size:20px;margin:0 0 12px}
+  h2{font-size:13px;margin:0 0 8px;color:#555;text-transform:uppercase;letter-spacing:.5px}
+  .card{background:#fff;border-radius:12px;padding:14px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+  input[type=text]{width:100%;padding:10px;font-size:15px;border:1px solid #ddd;border-radius:8px;margin-bottom:6px}
+  button{padding:9px 12px;font-size:14px;border:none;border-radius:8px;background:#007aff;color:#fff;cursor:pointer;margin:2px}
   button:active{background:#0051d5}
   button.sec{background:#e8e8ed;color:#222}
   button.sec:active{background:#d1d1d6}
-  .row{display:flex;flex-wrap:wrap;gap:4px}
-  .pad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-width:240px;margin:0 auto}
-  .pad button{padding:18px 0;font-size:18px}
+  button.danger{background:#cf222e}
+  button.warn{background:#bf8700}
+  .row{display:flex;flex-wrap:wrap;gap:3px;align-items:center}
+  .pad{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;max-width:230px;margin:0 auto}
+  .pad button{padding:16px 0;font-size:17px}
   .pad .empty{visibility:hidden}
-  #st{font-size:13px;color:#666;text-align:center;margin-top:8px;min-height:18px}
+  #st{font-size:12px;color:#666;text-align:center;margin-top:6px;min-height:16px}
   .ok{color:#1a7f37 !important}
   .err{color:#cf222e !important}
+  .rec{background:#cf222e;color:#fff;padding:10px;border-radius:8px;margin-bottom:10px;font-weight:600;text-align:center;cursor:pointer;user-select:none}
+  .rec.off{background:#34c759}
+  ol.stp{padding-left:22px;margin:6px 0;font-size:13px;max-height:280px;overflow-y:auto}
+  ol.stp li{margin-bottom:3px;line-height:1.4}
+  ol.stp li button{padding:1px 7px;font-size:11px;margin:0 1px}
+  .sv{display:flex;align-items:center;padding:6px 0;border-bottom:1px solid #eee;gap:4px}
+  .sv:last-child{border:none}
+  .sv span{flex:1;font-size:14px}
 </style>
 </head>
 <body>
+
 <h1>ESP32 Remote HID</h1>
 
+<div id="rec" class="rec off" onclick="toggleRec()">⏺ Záznam VYPNUTÝ — klikni pre zapnutie</div>
+
 <div class="card">
-  <h2>Klávesnica – text</h2>
+  <h2>Klávesnica — text</h2>
   <input id="txt" type="text" placeholder="Napíš text…" autocomplete="off">
   <div class="row">
-    <button onclick="sendText()">Odoslať</button>
-    <button class="sec" onclick="sendText(true)">Odoslať + Enter</button>
+    <button onclick="actText(false)">Odoslať</button>
+    <button class="sec" onclick="actText(true)">Odoslať + Enter</button>
   </div>
 </div>
 
 <div class="card">
   <h2>Špeciálne klávesy</h2>
   <div class="row">
-    <button class="sec" onclick="key('enter')">Enter</button>
-    <button class="sec" onclick="key('tab')">Tab</button>
-    <button class="sec" onclick="key('esc')">Esc</button>
-    <button class="sec" onclick="key('back')">⌫ Backspace</button>
-    <button class="sec" onclick="key('space')">Medzera</button>
-    <button class="sec" onclick="key('del')">Delete</button>
+    <button class="sec" onclick="actKey('enter')">Enter</button>
+    <button class="sec" onclick="actKey('tab')">Tab</button>
+    <button class="sec" onclick="actKey('esc')">Esc</button>
+    <button class="sec" onclick="actKey('back')">⌫</button>
+    <button class="sec" onclick="actKey('space')">Medzera</button>
+    <button class="sec" onclick="actKey('del')">Del</button>
+    <button class="sec" onclick="actKey('up')">↑</button>
+    <button class="sec" onclick="actKey('down')">↓</button>
+    <button class="sec" onclick="actKey('left')">←</button>
+    <button class="sec" onclick="actKey('right')">→</button>
   </div>
-  <h2 style="margin-top:12px">Kombinácie</h2>
+  <h2 style="margin-top:10px">Kombinácie</h2>
   <div class="row">
-    <button class="sec" onclick="combo('ctrl','c')">Ctrl+C</button>
-    <button class="sec" onclick="combo('ctrl','v')">Ctrl+V</button>
-    <button class="sec" onclick="combo('ctrl','z')">Ctrl+Z</button>
-    <button class="sec" onclick="combo('alt','tab')">Alt+Tab</button>
-    <button class="sec" onclick="combo('gui','d')">Win+D</button>
-    <button class="sec" onclick="combo('gui','r')">Win+R</button>
+    <button class="sec" onclick="actCombo('ctrl','c')">Ctrl+C</button>
+    <button class="sec" onclick="actCombo('ctrl','v')">Ctrl+V</button>
+    <button class="sec" onclick="actCombo('ctrl','x')">Ctrl+X</button>
+    <button class="sec" onclick="actCombo('ctrl','z')">Ctrl+Z</button>
+    <button class="sec" onclick="actCombo('ctrl','a')">Ctrl+A</button>
+    <button class="sec" onclick="actCombo('alt','tab')">Alt+Tab</button>
+    <button class="sec" onclick="actCombo('alt','f4')">Alt+F4</button>
+    <button class="sec" onclick="actCombo('gui','d')">Win+D</button>
+    <button class="sec" onclick="actCombo('gui','r')">Win+R</button>
+    <button class="sec" onclick="actCombo('gui','l')">Win+L</button>
+    <button class="sec" onclick="customCombo()">+ vlastná…</button>
   </div>
 </div>
 
@@ -376,46 +567,204 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   <h2>Myš</h2>
   <div class="pad">
     <button class="sec empty"></button>
-    <button class="sec" onclick="move(0,-30)">▲</button>
+    <button class="sec" onclick="actMove(0,-30)">▲</button>
     <button class="sec empty"></button>
-    <button class="sec" onclick="move(-30,0)">◀</button>
-    <button onclick="click('left')">●</button>
-    <button class="sec" onclick="move(30,0)">▶</button>
+    <button class="sec" onclick="actMove(-30,0)">◀</button>
+    <button onclick="actClick('left')">●</button>
+    <button class="sec" onclick="actMove(30,0)">▶</button>
     <button class="sec empty"></button>
-    <button class="sec" onclick="move(0,30)">▼</button>
+    <button class="sec" onclick="actMove(0,30)">▼</button>
     <button class="sec empty"></button>
   </div>
-  <div class="row" style="justify-content:center;margin-top:8px">
-    <button class="sec" onclick="click('left')">Ľavý klik</button>
-    <button class="sec" onclick="click('right')">Pravý klik</button>
-    <button class="sec" onclick="scrollW(-3)">Scroll ▲</button>
-    <button class="sec" onclick="scrollW(3)">Scroll ▼</button>
+  <div class="row" style="justify-content:center;margin-top:6px">
+    <button class="sec" onclick="actClick('left')">Ľavý</button>
+    <button class="sec" onclick="actClick('right')">Pravý</button>
+    <button class="sec" onclick="actClick('middle')">Stred</button>
+    <button class="sec" onclick="actScroll(-3)">Scroll ▲</button>
+    <button class="sec" onclick="actScroll(3)">Scroll ▼</button>
+    <button class="sec" onclick="customMove()">+ pohyb…</button>
   </div>
 </div>
 
-<div id="st">Pripojený k ESP32 v1.0.1</div>
+<div class="card">
+  <h2>Aktuálne makro (<span id="cnt">0</span> krokov)</h2>
+  <ol id="stp" class="stp"></ol>
+  <div class="row">
+    <button class="warn" onclick="addPause()">+ Pauza…</button>
+    <button onclick="runSteps()">▶ Spustiť</button>
+    <button class="danger" onclick="stopMacro()">⏹ Stop</button>
+    <button class="sec" onclick="clearSteps()">Vyčistiť</button>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <input id="mn" type="text" placeholder="Názov makra (a-z, 0-9, -, _)" style="flex:1;margin-bottom:0">
+    <button onclick="saveMacro()">Uložiť</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Uložené makrá</h2>
+  <div id="sv"></div>
+</div>
+
+<div id="st">Pripravený</div>
 
 <script>
 const st = document.getElementById('st');
-async function api(path, body) {
+let recording = false;
+let steps = [];
+
+async function api(p, b) {
   try {
-    const r = await fetch(path, {method:'POST', body});
+    const r = await fetch(p, {method:'POST', body:b||''});
     st.className = r.ok ? 'ok' : 'err';
-    st.textContent = r.ok ? '✓ '+path : '✗ '+r.status;
+    st.textContent = r.ok ? '✓ '+p : '✗ '+p+' '+r.status;
+    return r;
   } catch(e) { st.className='err'; st.textContent='✗ '+e.message; }
 }
-function sendText(withEnter) {
+
+function toggleRec() {
+  recording = !recording;
+  const b = document.getElementById('rec');
+  if (recording) {
+    b.classList.remove('off');
+    b.textContent = '⏺ Záznam ZAPNUTÝ — kliky pridávajú kroky';
+  } else {
+    b.classList.add('off');
+    b.textContent = '⏺ Záznam VYPNUTÝ — klikni pre zapnutie';
+  }
+}
+
+function rec(s) { steps.push(s); render(); }
+
+function desc(s) {
+  switch(s.a) {
+    case 'type':   return '📝 "' + s.t + '"';
+    case 'key':    return '⌨️ ' + s.k;
+    case 'combo':  return '🔗 ' + s.m + '+' + s.k;
+    case 'move':   return '🖱️ pohyb ('+s.x+', '+s.y+')';
+    case 'click':  return '👆 klik ' + s.b;
+    case 'scroll': return '🎡 scroll ' + s.d;
+    case 'wait':   return '⏱️ pauza ' + s.ms + ' ms';
+  }
+  return JSON.stringify(s);
+}
+
+function render() {
+  const ol = document.getElementById('stp');
+  document.getElementById('cnt').textContent = steps.length;
+  ol.innerHTML = '';
+  steps.forEach((s,i) => {
+    const li = document.createElement('li');
+    li.innerHTML = desc(s) +
+      ' <button class="sec" onclick="mv('+i+',-1)">↑</button>' +
+      '<button class="sec" onclick="mv('+i+',1)">↓</button>' +
+      '<button class="sec" onclick="del('+i+')">✕</button>';
+    ol.appendChild(li);
+  });
+}
+
+function del(i) { steps.splice(i,1); render(); }
+function mv(i,d) {
+  const j=i+d; if(j<0||j>=steps.length) return;
+  [steps[i],steps[j]]=[steps[j],steps[i]]; render();
+}
+function clearSteps() {
+  if (steps.length && !confirm('Vyčistiť '+steps.length+' krokov?')) return;
+  steps=[]; render();
+}
+function addPause() {
+  const ms = parseInt(prompt('Pauza v milisekundách:', '1000'));
+  if (ms > 0) rec({a:'wait', ms});
+}
+
+// ── Action dispatchers: recording → push step | normal → call API ─────────
+function actText(withEnter) {
   const t = document.getElementById('txt').value;
-  if(!t) return;
-  api('/api/type', t).then(()=>{ if(withEnter) api('/api/key','enter'); });
+  if (!t) return;
+  if (recording) {
+    rec({a:'type', t});
+    if (withEnter) rec({a:'key', k:'enter'});
+  } else {
+    api('/api/type', t).then(()=>{ if(withEnter) api('/api/key','enter'); });
+  }
   document.getElementById('txt').value='';
 }
-document.getElementById('txt').addEventListener('keydown', e=>{ if(e.key==='Enter') sendText(true); });
-function key(k)         { api('/api/key', k); }
-function combo(m,k)     { api('/api/combo', m+','+k); }
-function move(dx,dy)    { api('/api/move', dx+','+dy); }
-function click(b)       { api('/api/click', b); }
-function scrollW(d)     { api('/api/scroll', String(d)); }
+document.getElementById('txt').addEventListener('keydown', e=>{
+  if(e.key==='Enter') actText(true);
+});
+
+function actKey(k)        { recording ? rec({a:'key', k})       : api('/api/key', k); }
+function actCombo(m, k)   { recording ? rec({a:'combo', m, k})  : api('/api/combo', m+','+k); }
+function actMove(x, y)    { recording ? rec({a:'move', x, y})   : api('/api/move', x+','+y); }
+function actClick(b)      { recording ? rec({a:'click', b})     : api('/api/click', b); }
+function actScroll(d)     { recording ? rec({a:'scroll', d})    : api('/api/scroll', String(d)); }
+
+function customCombo() {
+  const m = prompt('Modifier (ctrl/alt/shift/gui):', 'ctrl'); if (!m) return;
+  const k = prompt('Kláves (písmeno alebo special key):', 'c'); if (!k) return;
+  actCombo(m.trim(), k.trim());
+}
+function customMove() {
+  const x = parseInt(prompt('Δx (-127 až 127):', '50')) || 0;
+  const y = parseInt(prompt('Δy (-127 až 127):', '0'))  || 0;
+  actMove(x, y);
+}
+
+// ── Macro storage ─────────────────────────────────────────────────────────
+async function runSteps() {
+  if (!steps.length) { alert('Žiadne kroky'); return; }
+  await api('/api/macro/run', JSON.stringify(steps));
+}
+async function stopMacro() { await api('/api/macro/stop'); }
+
+async function saveMacro() {
+  const name = document.getElementById('mn').value.trim();
+  if (!name) { alert('Zadaj názov makra'); return; }
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) { alert('Iba a-z, 0-9, -, _'); return; }
+  await api('/api/macro/save', name + '\n' + JSON.stringify(steps));
+  refreshSaved();
+}
+
+async function refreshSaved() {
+  try {
+    const r = await fetch('/api/macro/list');
+    const list = await r.json();
+    const div = document.getElementById('sv');
+    div.innerHTML = '';
+    if (!list.length) { div.textContent = '(žiadne uložené makrá)'; return; }
+    list.sort();
+    list.forEach(name => {
+      const it = document.createElement('div');
+      it.className = 'sv';
+      it.innerHTML = '<span>'+name+'</span>'+
+        '<button onclick="runSaved(\''+name+'\')">▶</button>'+
+        '<button class="sec" onclick="loadSaved(\''+name+'\')">✎</button>'+
+        '<button class="danger" onclick="delSaved(\''+name+'\')">✕</button>';
+      div.appendChild(it);
+    });
+  } catch(e) { console.error(e); }
+}
+
+async function runSaved(name) {
+  const r = await fetch('/api/macro/get?name='+encodeURIComponent(name));
+  if (!r.ok) return;
+  const body = await r.text();
+  await api('/api/macro/run', body);
+}
+async function loadSaved(name) {
+  const r = await fetch('/api/macro/get?name='+encodeURIComponent(name));
+  if (!r.ok) return;
+  steps = await r.json();
+  document.getElementById('mn').value = name;
+  render();
+}
+async function delSaved(name) {
+  if (!confirm('Vymazať makro "'+name+'"?')) return;
+  await api('/api/macro/del', name);
+  refreshSaved();
+}
+
+window.addEventListener('load', refreshSaved);
 </script>
 </body>
 </html>)HTML";
@@ -506,6 +855,69 @@ void setupWebServer() {
         webServer.send(200, "text/plain", "ok");
     });
 
+    // ── Makrá ─────────────────────────────────────────────────────────────
+    // POST /api/macro/run    body: JSON array krokov
+    webServer.on("/api/macro/run", HTTP_POST, []() {
+        if (macroRunning) {
+            webServer.send(409, "text/plain", "macro already running");
+            return;
+        }
+        if (macro_start(webServer.arg("plain"))) {
+            webServer.send(200, "text/plain", "started");
+        } else {
+            webServer.send(500, "text/plain", "start failed");
+        }
+    });
+
+    // POST /api/macro/stop
+    webServer.on("/api/macro/stop", HTTP_POST, []() {
+        macroStopRequested = true;
+        webServer.send(200, "text/plain", "stop requested");
+    });
+
+    // GET /api/macro/status → {"running":bool}
+    webServer.on("/api/macro/status", HTTP_GET, []() {
+        webServer.send(200, "application/json",
+                       macroRunning ? "{\"running\":true}" : "{\"running\":false}");
+    });
+
+    // POST /api/macro/save   body: "name\n[json array]"
+    webServer.on("/api/macro/save", HTTP_POST, []() {
+        String body = webServer.arg("plain");
+        int nl = body.indexOf('\n');
+        if (nl < 1) { webServer.send(400, "text/plain", "bad format"); return; }
+        String name = body.substring(0, nl);  name.trim();
+        String steps = body.substring(nl + 1);
+        if (!macro_name_valid(name)) {
+            webServer.send(400, "text/plain", "invalid name (a-z, 0-9, -, _ only)");
+            return;
+        }
+        if (macro_save(name, steps)) webServer.send(200, "text/plain", "saved");
+        else                          webServer.send(500, "text/plain", "save failed");
+    });
+
+    // GET /api/macro/list → JSON array of names
+    webServer.on("/api/macro/list", HTTP_GET, []() {
+        webServer.send(200, "application/json", macro_list_json());
+    });
+
+    // GET /api/macro/get?name=X → JSON array of steps
+    webServer.on("/api/macro/get", HTTP_GET, []() {
+        String name = webServer.arg("name");
+        if (!macro_name_valid(name)) { webServer.send(400, "text/plain", "invalid name"); return; }
+        String content = macro_load(name);
+        if (content.isEmpty()) { webServer.send(404, "text/plain", "not found"); return; }
+        webServer.send(200, "application/json", content);
+    });
+
+    // POST /api/macro/del    body: name
+    webServer.on("/api/macro/del", HTTP_POST, []() {
+        String name = webServer.arg("plain"); name.trim();
+        if (!macro_name_valid(name)) { webServer.send(400, "text/plain", "invalid name"); return; }
+        if (macro_delete(name)) webServer.send(200, "text/plain", "deleted");
+        else                     webServer.send(500, "text/plain", "delete failed");
+    });
+
     webServer.onNotFound([]() {
         webServer.send(404, "text/plain", "not found");
     });
@@ -532,6 +944,14 @@ void setup() {
     hid_begin();
     delay(1000);  // Počkaj na USB enumeráciu hostom (PC)
     Serial.println("[HID] USB Mouse + Keyboard aktívne");
+
+    // LittleFS – úložisko pre uložené makrá. true = naformátuje pri prvom štarte.
+    if (!LittleFS.begin(true)) {
+        Serial.println("[FS] LittleFS inicializácia ZLYHALA – makrá nebudú perzistentné");
+    } else {
+        Serial.println("[FS] LittleFS OK");
+        if (!LittleFS.exists("/macros")) LittleFS.mkdir("/macros");
+    }
 
     startWiFiManager(false);
 
