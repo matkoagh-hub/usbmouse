@@ -45,7 +45,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Zvýš pri každom release pushnutom na GitHub (semver "major.minor.patch")
-#define FIRMWARE_VERSION       "1.0.2"
+#define FIRMWARE_VERSION       "1.0.3"
 
 // GitHub repo odkiaľ sa sťahujú aktualizácie
 #define GITHUB_REPO            "matkoagh-hub/usbmouse"
@@ -244,6 +244,11 @@ bool ota_checkAndUpdate() {
 static unsigned long lastOtaCheck   = 0;
 static unsigned long bootBtnPressed = 0;
 static bool          btnWasDown     = false;
+
+// ── Mouse jiggler – každých 5 minút pohne myšou o 2 px tam a späť ─────────
+#define JIGGLE_INTERVAL_MS (5UL * 60UL * 1000UL)
+static bool          jigglerEnabled = false;
+static unsigned long lastJiggle     = 0;
 
 static void startWiFiManager(bool forceConfig) {
     WiFiManager wm;
@@ -510,6 +515,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   .err{color:#cf222e !important}
   .rec{background:#cf222e;color:#fff;padding:10px;border-radius:8px;margin-bottom:10px;font-weight:600;text-align:center;cursor:pointer;user-select:none}
   .rec.off{background:#34c759}
+  .jig{background:#e8e8ed;color:#222;padding:10px;border-radius:8px;margin-bottom:10px;font-weight:600;text-align:center;cursor:pointer;user-select:none}
+  .jig.on{background:#ff9f0a;color:#fff}
   ol.stp{padding-left:22px;margin:6px 0;font-size:13px;max-height:280px;overflow-y:auto}
   ol.stp li{margin-bottom:3px;line-height:1.4}
   ol.stp li button{padding:1px 7px;font-size:11px;margin:0 1px}
@@ -523,6 +530,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 <h1>ESP32 Remote HID</h1>
 
 <div id="rec" class="rec off" onclick="toggleRec()">⏺ Záznam VYPNUTÝ — klikni pre zapnutie</div>
+<div id="jig" class="jig" onclick="toggleJiggle()">🖱️ Mouse Jiggler VYPNUTÝ — klikni pre zapnutie</div>
 
 <div class="card">
   <h2>Klávesnica — text</h2>
@@ -764,7 +772,34 @@ async function delSaved(name) {
   refreshSaved();
 }
 
-window.addEventListener('load', refreshSaved);
+// ── Mouse Jiggler ─────────────────────────────────────────────────────────
+async function toggleJiggle() {
+  const r = await api('/api/jiggle', '');
+  if (!r) return;
+  const data = await r.json();
+  const el = document.getElementById('jig');
+  if (data.enabled) {
+    el.classList.add('on');
+    el.textContent = '🖱️ Mouse Jiggler ZAPNUTÝ — pohybuje každých 5 min';
+  } else {
+    el.classList.remove('on');
+    el.textContent = '🖱️ Mouse Jiggler VYPNUTÝ — klikni pre zapnutie';
+  }
+}
+
+async function initJiggler() {
+  try {
+    const r = await fetch('/api/jiggle/status');
+    const data = await r.json();
+    const el = document.getElementById('jig');
+    if (data.enabled) {
+      el.classList.add('on');
+      el.textContent = '🖱️ Mouse Jiggler ZAPNUTÝ — pohybuje každých 5 min';
+    }
+  } catch(e) {}
+}
+
+window.addEventListener('load', () => { refreshSaved(); initJiggler(); });
 </script>
 </body>
 </html>)HTML";
@@ -910,6 +945,24 @@ void setupWebServer() {
         webServer.send(200, "application/json", content);
     });
 
+    // POST /api/jiggle        body: "1" zapnúť / "0" vypnúť / prázdne = toggle
+    webServer.on("/api/jiggle", HTTP_POST, []() {
+        String b = webServer.arg("plain");
+        if (b == "1")      jigglerEnabled = true;
+        else if (b == "0") jigglerEnabled = false;
+        else               jigglerEnabled = !jigglerEnabled;
+        if (jigglerEnabled) lastJiggle = millis() - JIGGLE_INTERVAL_MS; // prvý jiggle ihneď
+        Serial.printf("[Jiggle] %s\n", jigglerEnabled ? "zapnutý" : "vypnutý");
+        webServer.send(200, "application/json",
+                       jigglerEnabled ? "{\"enabled\":true}" : "{\"enabled\":false}");
+    });
+
+    // GET /api/jiggle/status
+    webServer.on("/api/jiggle/status", HTTP_GET, []() {
+        webServer.send(200, "application/json",
+                       jigglerEnabled ? "{\"enabled\":true}" : "{\"enabled\":false}");
+    });
+
     // POST /api/macro/del    body: name
     webServer.on("/api/macro/del", HTTP_POST, []() {
         String name = webServer.arg("plain"); name.trim();
@@ -968,6 +1021,15 @@ void loop() {
 
     // Obsluha web requestov (musí byť volaná často)
     webServer.handleClient();
+
+    // Mouse jiggler – pohne myšou o 2 px doprava a späť, každých 5 minút
+    if (jigglerEnabled && millis() - lastJiggle >= JIGGLE_INTERVAL_MS) {
+        lastJiggle = millis();
+        mouse_move(2, 0);
+        delay(80);
+        mouse_move(-2, 0);
+        Serial.println("[Jiggle] pohyb");
+    }
 
     // Periodická OTA kontrola
     if (millis() - lastOtaCheck >= OTA_CHECK_INTERVAL_MS) {
