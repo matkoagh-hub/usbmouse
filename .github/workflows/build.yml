@@ -1,0 +1,128 @@
+name: Build & Release Firmware
+
+# Spustí sa:
+#  - pri pushnutí tagu  v*.*.* (napr. v1.0.1)  → kompiluje + vytvorí GitHub Release
+#  - pri PR na main                             → len kompiluje (overenie správnosti)
+#  - manuálne cez GitHub UI (Actions → Run workflow)
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # Potrebné pre vytvorenie GitHub Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Stiahni kód ────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Nainštaluj Arduino CLI ─────────────────────────────────────────
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      # ── 3. Cache – ESP32 toolchain je ~250 MB, šetrí čas pri ďalších buildoch
+      - name: Cache Arduino data
+        uses: actions/cache@v4
+        with:
+          path: ~/.arduino15
+          key: arduino-esp32-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: arduino-esp32-
+
+      # ── 4. Pridaj ESP32 board manager a nainštaluj core ──────────────────
+      - name: Install ESP32 Arduino core
+        run: |
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      # ── 5. Knižnice potrebné pre sketch ───────────────────────────────────
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "WiFiManager"
+          arduino-cli lib install "ArduinoJson"
+
+      # ── 6. Overenie: verzia v config.h musí zodpovedať git tagu ──────────
+      #        Zabraňuje vydaniu release kde tag a firmware verzia nesedia
+      - name: Verify version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CFG=$(grep -oP '#define FIRMWARE_VERSION "\K[^"]+' config.h)
+          echo "Git tag verzia:    v${TAG}"
+          echo "config.h verzia:   ${CFG}"
+          if [ "$TAG" != "$CFG" ]; then
+            echo "::error::Tag (v${TAG}) sa nezhoduje s FIRMWARE_VERSION \"${CFG}\" v config.h"
+            echo "::error::Uprav config.h a commitni pred vytvorením tagu."
+            exit 1
+          fi
+          echo "Verzie sa zhodujú."
+
+      # ── 7. Kompiluj sketch ────────────────────────────────────────────────
+      #   FQBN nastavenia zodpovedajú Arduino IDE:
+      #     USB Mode        → USB-OTG (TinyUSB)   ← nutné pre HID
+      #     USB CDC on Boot → Disabled
+      #     Partition       → Default 4MB
+      - name: Compile sketch
+        run: |
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,PartitionScheme=default,FlashSize=4M,FlashMode=qio" \
+            --output-dir ./build \
+            .
+
+          echo "--- Výstupné súbory ---"
+          ls -lh ./build/
+
+          # Premenuj hlavný binary na firmware.bin (OTA updater hľadá práve tento názov)
+          MAIN_BIN=$(find ./build -maxdepth 1 -name "*.ino.bin" \
+                     ! -name "*.bootloader.bin" \
+                     ! -name "*.partitions.bin" \
+                     | head -1)
+
+          if [ -z "$MAIN_BIN" ]; then
+            echo "::error::Nenašiel sa skompilovaný .ino.bin súbor v ./build/"
+            ls ./build/
+            exit 1
+          fi
+
+          cp "$MAIN_BIN" ./build/firmware.bin
+          echo "Firmware: $(ls -lh ./build/firmware.bin)"
+
+      # ── 8. Ulož artifact (dostupný aj pre PR buildy, bez release) ─────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.ref_name || 'dev' }}
+          path: ./build/firmware.bin
+          if-no-files-found: error
+
+      # ── 9. Vytvor GitHub Release a prihoď firmware.bin (len pri tagu) ─────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Firmware ${{ github.ref_name }}"
+          body: |
+            ## Firmware ${{ github.ref_name }}
+
+            Automaticky zostavená verzia pre **ESP32-S3** (USB-OTG / TinyUSB).
+
+            ### Automatická aktualizácia
+            ESP zariadenie si stiahne túto verziu samo do **1 hodiny**.
+            Pre okamžitú aktualizáciu reštartuj zariadenie.
+
+            ### Manuálna inštalácia
+            Ak potrebuješ nahrať firmware ručne cez Arduino IDE alebo `esptool`:
+            ```
+            esptool.py --chip esp32s3 write_flash 0x10000 firmware.bin
+            ```
+          files: ./build/firmware.bin
+          fail_on_unmatched_files: true
