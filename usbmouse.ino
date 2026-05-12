@@ -30,6 +30,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WebServer.h>
 #include <HTTPClient.h>
 #include <Update.h>
 #include <WiFiManager.h>
@@ -43,7 +44,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Zvýš pri každom release pushnutom na GitHub (semver "major.minor.patch")
-#define FIRMWARE_VERSION       "1.0.0"
+#define FIRMWARE_VERSION       "1.0.1"
 
 // GitHub repo odkiaľ sa sťahujú aktualizácie
 #define GITHUB_REPO            "matkoagh-hub/usbmouse"
@@ -307,6 +308,213 @@ static void ensureWiFi() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Web UI – ovládanie HID cez prehliadač
+// ═══════════════════════════════════════════════════════════════════════════════
+
+WebServer webServer(80);
+
+static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
+<html lang="sk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Remote HID</title>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,system-ui,sans-serif;max-width:520px;margin:0 auto;padding:16px;background:#f0f2f5;color:#222}
+  h1{font-size:20px;margin:0 0 16px}
+  h2{font-size:14px;margin:0 0 8px;color:#555;text-transform:uppercase;letter-spacing:.5px}
+  .card{background:#fff;border-radius:12px;padding:16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+  input[type=text]{width:100%;padding:12px;font-size:16px;border:1px solid #ddd;border-radius:8px;margin-bottom:8px}
+  button{padding:10px 14px;font-size:15px;border:none;border-radius:8px;background:#007aff;color:#fff;cursor:pointer;margin:3px}
+  button:active{background:#0051d5}
+  button.sec{background:#e8e8ed;color:#222}
+  button.sec:active{background:#d1d1d6}
+  .row{display:flex;flex-wrap:wrap;gap:4px}
+  .pad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-width:240px;margin:0 auto}
+  .pad button{padding:18px 0;font-size:18px}
+  .pad .empty{visibility:hidden}
+  #st{font-size:13px;color:#666;text-align:center;margin-top:8px;min-height:18px}
+  .ok{color:#1a7f37 !important}
+  .err{color:#cf222e !important}
+</style>
+</head>
+<body>
+<h1>ESP32 Remote HID</h1>
+
+<div class="card">
+  <h2>Klávesnica – text</h2>
+  <input id="txt" type="text" placeholder="Napíš text…" autocomplete="off">
+  <div class="row">
+    <button onclick="sendText()">Odoslať</button>
+    <button class="sec" onclick="sendText(true)">Odoslať + Enter</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Špeciálne klávesy</h2>
+  <div class="row">
+    <button class="sec" onclick="key('enter')">Enter</button>
+    <button class="sec" onclick="key('tab')">Tab</button>
+    <button class="sec" onclick="key('esc')">Esc</button>
+    <button class="sec" onclick="key('back')">⌫ Backspace</button>
+    <button class="sec" onclick="key('space')">Medzera</button>
+    <button class="sec" onclick="key('del')">Delete</button>
+  </div>
+  <h2 style="margin-top:12px">Kombinácie</h2>
+  <div class="row">
+    <button class="sec" onclick="combo('ctrl','c')">Ctrl+C</button>
+    <button class="sec" onclick="combo('ctrl','v')">Ctrl+V</button>
+    <button class="sec" onclick="combo('ctrl','z')">Ctrl+Z</button>
+    <button class="sec" onclick="combo('alt','tab')">Alt+Tab</button>
+    <button class="sec" onclick="combo('gui','d')">Win+D</button>
+    <button class="sec" onclick="combo('gui','r')">Win+R</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Myš</h2>
+  <div class="pad">
+    <button class="sec empty"></button>
+    <button class="sec" onclick="move(0,-30)">▲</button>
+    <button class="sec empty"></button>
+    <button class="sec" onclick="move(-30,0)">◀</button>
+    <button onclick="click('left')">●</button>
+    <button class="sec" onclick="move(30,0)">▶</button>
+    <button class="sec empty"></button>
+    <button class="sec" onclick="move(0,30)">▼</button>
+    <button class="sec empty"></button>
+  </div>
+  <div class="row" style="justify-content:center;margin-top:8px">
+    <button class="sec" onclick="click('left')">Ľavý klik</button>
+    <button class="sec" onclick="click('right')">Pravý klik</button>
+    <button class="sec" onclick="scrollW(-3)">Scroll ▲</button>
+    <button class="sec" onclick="scrollW(3)">Scroll ▼</button>
+  </div>
+</div>
+
+<div id="st">Pripojený k ESP32 v1.0.1</div>
+
+<script>
+const st = document.getElementById('st');
+async function api(path, body) {
+  try {
+    const r = await fetch(path, {method:'POST', body});
+    st.className = r.ok ? 'ok' : 'err';
+    st.textContent = r.ok ? '✓ '+path : '✗ '+r.status;
+  } catch(e) { st.className='err'; st.textContent='✗ '+e.message; }
+}
+function sendText(withEnter) {
+  const t = document.getElementById('txt').value;
+  if(!t) return;
+  api('/api/type', t).then(()=>{ if(withEnter) api('/api/key','enter'); });
+  document.getElementById('txt').value='';
+}
+document.getElementById('txt').addEventListener('keydown', e=>{ if(e.key==='Enter') sendText(true); });
+function key(k)         { api('/api/key', k); }
+function combo(m,k)     { api('/api/combo', m+','+k); }
+function move(dx,dy)    { api('/api/move', dx+','+dy); }
+function click(b)       { api('/api/click', b); }
+function scrollW(d)     { api('/api/scroll', String(d)); }
+</script>
+</body>
+</html>)HTML";
+
+// Pomocná funkcia – preloží názov klávesu zo stringu na HID kód
+static uint8_t keyFromName(const String& n) {
+    if (n == "enter")  return KEY_RETURN;
+    if (n == "tab")    return KEY_TAB;
+    if (n == "esc")    return KEY_ESC;
+    if (n == "back")   return KEY_BACKSPACE;
+    if (n == "space")  return ' ';
+    if (n == "del")    return KEY_DELETE;
+    if (n == "up")     return KEY_UP_ARROW;
+    if (n == "down")   return KEY_DOWN_ARROW;
+    if (n == "left")   return KEY_LEFT_ARROW;
+    if (n == "right")  return KEY_RIGHT_ARROW;
+    if (n.length() == 1) return (uint8_t)n[0];   // jedno písmeno
+    return 0;
+}
+
+static uint8_t modifierFromName(const String& n) {
+    if (n == "ctrl")  return KEY_LEFT_CTRL;
+    if (n == "alt")   return KEY_LEFT_ALT;
+    if (n == "shift") return KEY_LEFT_SHIFT;
+    if (n == "gui")   return KEY_LEFT_GUI;   // Win / ⌘
+    return 0;
+}
+
+void setupWebServer() {
+    webServer.on("/", HTTP_GET, []() {
+        webServer.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+    });
+
+    // POST /api/type   body: "text na napísanie"
+    webServer.on("/api/type", HTTP_POST, []() {
+        kb_print(webServer.arg("plain").c_str());
+        webServer.send(200, "text/plain", "ok");
+    });
+
+    // POST /api/key    body: "enter" | "tab" | "esc" | ...
+    webServer.on("/api/key", HTTP_POST, []() {
+        uint8_t k = keyFromName(webServer.arg("plain"));
+        if (k) kb_tap(k);
+        webServer.send(200, "text/plain", "ok");
+    });
+
+    // POST /api/combo  body: "ctrl,c"
+    webServer.on("/api/combo", HTTP_POST, []() {
+        String body = webServer.arg("plain");
+        int comma = body.indexOf(',');
+        if (comma > 0) {
+            uint8_t mod = modifierFromName(body.substring(0, comma));
+            uint8_t k   = keyFromName(body.substring(comma + 1));
+            if (mod && k) kb_combo(mod, k);
+        }
+        webServer.send(200, "text/plain", "ok");
+    });
+
+    // POST /api/move   body: "dx,dy"
+    webServer.on("/api/move", HTTP_POST, []() {
+        String body = webServer.arg("plain");
+        int comma = body.indexOf(',');
+        if (comma > 0) {
+            int dx = body.substring(0, comma).toInt();
+            int dy = body.substring(comma + 1).toInt();
+            // Clampuj na rozsah int8_t aby HID API nepretieklo
+            dx = constrain(dx, -127, 127);
+            dy = constrain(dy, -127, 127);
+            mouse_move((int8_t)dx, (int8_t)dy);
+        }
+        webServer.send(200, "text/plain", "ok");
+    });
+
+    // POST /api/click  body: "left" | "right" | "middle"
+    webServer.on("/api/click", HTTP_POST, []() {
+        String btn = webServer.arg("plain");
+        uint8_t b = MOUSE_LEFT;
+        if (btn == "right")  b = MOUSE_RIGHT;
+        if (btn == "middle") b = MOUSE_MIDDLE;
+        mouse_click(b);
+        webServer.send(200, "text/plain", "ok");
+    });
+
+    // POST /api/scroll body: "+/-N"
+    webServer.on("/api/scroll", HTTP_POST, []() {
+        int d = constrain(webServer.arg("plain").toInt(), -127, 127);
+        mouse_scroll((int8_t)d);
+        webServer.send(200, "text/plain", "ok");
+    });
+
+    webServer.onNotFound([]() {
+        webServer.send(404, "text/plain", "not found");
+    });
+
+    webServer.begin();
+    Serial.printf("[Web] Server beží na http://%s/\n", WiFi.localIP().toString().c_str());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Setup & Loop
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -327,6 +535,9 @@ void setup() {
 
     startWiFiManager(false);
 
+    // Web UI – ovládanie HID cez prehliadač na IP adrese ESP
+    setupWebServer();
+
     // Prvá OTA kontrola ihneď po štarte (spustí sa pri prvom prechode loop())
     lastOtaCheck = millis() - OTA_CHECK_INTERVAL_MS;
 }
@@ -334,6 +545,9 @@ void setup() {
 void loop() {
     handleResetButton();
     ensureWiFi();
+
+    // Obsluha web requestov (musí byť volaná často)
+    webServer.handleClient();
 
     // Periodická OTA kontrola
     if (millis() - lastOtaCheck >= OTA_CHECK_INTERVAL_MS) {
