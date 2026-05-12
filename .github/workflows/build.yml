@@ -50,18 +50,18 @@ jobs:
           arduino-cli lib install "WiFiManager"
           arduino-cli lib install "ArduinoJson"
 
-      # ── 6. Overenie: verzia v config.h musí zodpovedať git tagu ──────────
+      # ── 6. Overenie: verzia v usbmouse.ino musí zodpovedať git tagu ─────
       #        Zabraňuje vydaniu release kde tag a firmware verzia nesedia
       - name: Verify version matches tag
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           TAG="${GITHUB_REF_NAME#v}"
-          CFG=$(grep -oP '#define FIRMWARE_VERSION "\K[^"]+' config.h)
-          echo "Git tag verzia:    v${TAG}"
-          echo "config.h verzia:   ${CFG}"
+          CFG=$(grep -oP '#define FIRMWARE_VERSION\s+"\K[^"]+' usbmouse.ino)
+          echo "Git tag verzia:        v${TAG}"
+          echo "usbmouse.ino verzia:   ${CFG}"
           if [ "$TAG" != "$CFG" ]; then
-            echo "::error::Tag (v${TAG}) sa nezhoduje s FIRMWARE_VERSION \"${CFG}\" v config.h"
-            echo "::error::Uprav config.h a commitni pred vytvorením tagu."
+            echo "::error::Tag (v${TAG}) sa nezhoduje s FIRMWARE_VERSION \"${CFG}\" v usbmouse.ino"
+            echo "::error::Uprav usbmouse.ino a commitni pred vytvorením tagu."
             exit 1
           fi
           echo "Verzie sa zhodujú."
