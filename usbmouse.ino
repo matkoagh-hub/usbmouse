@@ -46,7 +46,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Zvýš pri každom release pushnutom na GitHub (semver "major.minor.patch")
-#define FIRMWARE_VERSION       "1.0.7"
+#define FIRMWARE_VERSION       "1.0.8"
 
 // GitHub repo odkiaľ sa sťahujú aktualizácie
 #define GITHUB_REPO            "matkoagh-hub/usbmouse"
@@ -100,6 +100,22 @@ inline void kb_combo(uint8_t modifier, uint8_t key) {
     delay(10);
     hidKeyboard.press(key);
     delay(30);
+    hidKeyboard.releaseAll();
+}
+
+// Viac modifikátorov naraz: mods = "ctrl+alt", key = KEY_DELETE
+static void kb_combo_multi(const String& mods, uint8_t key) {
+    int start = 0;
+    while (start < (int)mods.length()) {
+        int plus = mods.indexOf('+', start);
+        String m = (plus < 0) ? mods.substring(start) : mods.substring(start, plus);
+        uint8_t code = modifierFromName(m);
+        if (code) hidKeyboard.press(code);
+        if (plus < 0) break;
+        start = plus + 1;
+    }
+    if (key) hidKeyboard.press(key);
+    delay(50);
     hidKeyboard.releaseAll();
 }
 
@@ -342,9 +358,8 @@ static void executeStep(JsonObject step) {
         if (code) kb_tap(code);
     }
     else if (!strcmp(a, "combo")) {
-        uint8_t mod  = modifierFromName(String(step["m"] | ""));
         uint8_t code = keyFromName(String(step["k"] | ""));
-        if (mod && code) kb_combo(mod, code);
+        if (code) kb_combo_multi(String(step["m"] | ""), code);
     }
     else if (!strcmp(a, "move")) {
         int x = constrain((int)(step["x"] | 0), -127, 127);
@@ -584,6 +599,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
     <button class="sec" onclick="actCombo('gui','d')">Win+D</button>
     <button class="sec" onclick="actCombo('gui','r')">Win+R</button>
     <button class="sec" onclick="actCombo('gui','l')">Win+L</button>
+    <button class="sec" onclick="actCombo('ctrl+alt','del')">Ctrl+Alt+Del</button>
     <button class="sec" onclick="customCombo()">+ vlastná…</button>
   </div>
 </div>
@@ -900,14 +916,13 @@ void setupWebServer() {
         webServer.send(200, "text/plain", "ok");
     });
 
-    // POST /api/combo  body: "ctrl,c"
+    // POST /api/combo  body: "ctrl,c" alebo "ctrl+alt,del"
     webServer.on("/api/combo", HTTP_POST, []() {
         String body = webServer.arg("plain");
-        int comma = body.indexOf(',');
+        int comma = body.lastIndexOf(',');
         if (comma > 0) {
-            uint8_t mod = modifierFromName(body.substring(0, comma));
-            uint8_t k   = keyFromName(body.substring(comma + 1));
-            if (mod && k) kb_combo(mod, k);
+            uint8_t k = keyFromName(body.substring(comma + 1));
+            if (k) kb_combo_multi(body.substring(0, comma), k);
         }
         webServer.send(200, "text/plain", "ok");
     });
