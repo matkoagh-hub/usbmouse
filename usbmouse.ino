@@ -103,6 +103,9 @@ inline void kb_combo(uint8_t modifier, uint8_t key) {
     hidKeyboard.releaseAll();
 }
 
+// Forward decl – definícia je nižšie pri WebUI sekcii
+static uint8_t modifierFromName(const String& n);
+
 // Viac modifikátorov naraz: mods = "ctrl+alt", key = KEY_DELETE
 static void kb_combo_multi(const String& mods, uint8_t key) {
     int start = 0;
