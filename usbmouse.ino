@@ -46,7 +46,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Zvýš pri každom release pushnutom na GitHub (semver "major.minor.patch")
-#define FIRMWARE_VERSION       "1.1.0"
+#define FIRMWARE_VERSION       "1.1.1"
 
 // GitHub repo odkiaľ sa sťahujú aktualizácie
 #define GITHUB_REPO            "matkoagh-hub/usbmouse"
@@ -267,7 +267,7 @@ static bool          btnWasDown     = false;
 
 // ── Mouse jiggler – každých 5 minút pohne myšou o 2 px tam a späť ─────────
 #define JIGGLE_INTERVAL_MS (5UL * 60UL * 1000UL)
-static bool          jigglerEnabled = false;
+static bool          jigglerEnabled = true;
 static unsigned long lastJiggle     = 0;
 
 static void startWiFiManager(bool forceConfig) {
@@ -904,25 +904,47 @@ async function reboot() {
 
 // ── Touchpad ──────────────────────────────────────────────────────────────
 let tpActive = false;
-let tpLx = 0, tpLy = 0;          // last pointer position
-let tpAx = 0, tpAy = 0;          // accumulated sub-pixel delta
-let tpT0 = 0;                     // pointer-down timestamp (for tap detection)
-let tpStartX = 0, tpStartY = 0;  // pointer-down position (for tap detection)
-const TAP_MAX_MS  = 200;
-const TAP_MAX_PX  = 10;
+let tpLx = 0, tpLy = 0;
+let tpAx = 0, tpAy = 0;
+let tpT0 = 0;
+let tpStartX = 0, tpStartY = 0;
+let tpRafId = null;
+const TAP_MAX_MS = 200;
+const TAP_MAX_PX = 10;
 
 function tpSensitivity() {
   return parseFloat(document.getElementById('tpSens').value) || 1.5;
 }
 
-function tpFlush() {
+// Fire-and-forget move: no await, no status-bar update, minimal overhead
+function tpSendMove(ix, iy) {
+  const cl = v => Math.max(-127, Math.min(127, v));
+  fetch('/api/move', {method:'POST', body: cl(ix)+','+cl(iy)}).catch(()=>{});
+}
+
+// Called at most once per animation frame (~60 fps)
+function tpDoFlush() {
+  tpRafId = null;
   const ix = Math.trunc(tpAx);
   const iy = Math.trunc(tpAy);
-  if (ix === 0 && iy === 0) return;
-  const clamped = v => Math.max(-127, Math.min(127, v));
-  actMove(clamped(ix), clamped(iy));
-  tpAx -= ix;
-  tpAy -= iy;
+  if (ix !== 0 || iy !== 0) {
+    tpSendMove(ix, iy);
+    tpAx -= ix;
+    tpAy -= iy;
+  }
+}
+
+function tpScheduleFlush() {
+  if (!tpRafId) tpRafId = requestAnimationFrame(tpDoFlush);
+}
+
+// Flush remaining sub-pixel delta immediately (end of gesture)
+function tpFlushFinal() {
+  if (tpRafId) { cancelAnimationFrame(tpRafId); tpRafId = null; }
+  const ix = Math.trunc(tpAx);
+  const iy = Math.trunc(tpAy);
+  if (ix !== 0 || iy !== 0) tpSendMove(ix, iy);
+  tpAx = 0; tpAy = 0;
 }
 
 function tpStart(e) {
@@ -940,11 +962,11 @@ function tpMove(e) {
   e.preventDefault();
   if (!tpActive) return;
   const pt = e.touches ? e.touches[0] : e;
-  const dx = (pt.clientX - tpLx) * tpSensitivity();
-  const dy = (pt.clientY - tpLy) * tpSensitivity();
+  const sens = tpSensitivity();
+  tpAx += (pt.clientX - tpLx) * sens;
+  tpAy += (pt.clientY - tpLy) * sens;
   tpLx = pt.clientX; tpLy = pt.clientY;
-  tpAx += dx; tpAy += dy;
-  tpFlush();
+  tpScheduleFlush();   // accumulate until next animation frame
 }
 
 function tpEnd(e) {
@@ -952,16 +974,13 @@ function tpEnd(e) {
   document.getElementById('tp').classList.remove('drag');
   if (!tpActive) return;
   tpActive = false;
-  tpFlush();
-  // Tap-to-click: short, stationary touch
+  tpFlushFinal();
   const dt = Date.now() - tpT0;
   const dist = Math.hypot(
     (e.changedTouches ? e.changedTouches[0].clientX : e.clientX) - tpStartX,
     (e.changedTouches ? e.changedTouches[0].clientY : e.clientY) - tpStartY
   );
-  if (dt < TAP_MAX_MS && dist < TAP_MAX_PX) {
-    actClick('left');
-  }
+  if (dt < TAP_MAX_MS && dist < TAP_MAX_PX) actClick('left');
 }
 
 function setMouseMode(m) {
