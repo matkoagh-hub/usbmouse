@@ -46,7 +46,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Zvýš pri každom release pushnutom na GitHub (semver "major.minor.patch")
-#define FIRMWARE_VERSION       "1.0.6"
+#define FIRMWARE_VERSION       "1.0.7"
 
 // GitHub repo odkiaľ sa sťahujú aktualizácie
 #define GITHUB_REPO            "matkoagh-hub/usbmouse"
@@ -514,10 +514,13 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   #st{font-size:12px;color:#666;text-align:center;margin-top:6px;min-height:16px}
   .ok{color:#1a7f37 !important}
   .err{color:#cf222e !important}
-  .rec{background:#cf222e;color:#fff;padding:10px;border-radius:8px;margin-bottom:10px;font-weight:600;text-align:center;cursor:pointer;user-select:none}
-  .rec.off{background:#34c759}
-  .jig{background:#e8e8ed;color:#222;padding:10px;border-radius:8px;margin-bottom:10px;font-weight:600;text-align:center;cursor:pointer;user-select:none}
-  .jig.on{background:#ff9f0a;color:#fff}
+  .trow{display:flex;align-items:center;justify-content:space-between;background:#fff;border-radius:12px;padding:14px 16px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,.05);cursor:pointer;user-select:none}
+  .trow-lbl{font-size:16px;font-weight:500;margin-bottom:3px}
+  .trow-sub{font-size:12px;color:#8e8e93}
+  .sw{width:51px;height:31px;background:#e5e5ea;border-radius:31px;position:relative;transition:background .25s;flex-shrink:0}
+  .sw::after{content:'';position:absolute;width:27px;height:27px;background:#fff;border-radius:50%;top:2px;left:2px;transition:transform .25s;box-shadow:0 2px 5px rgba(0,0,0,.25)}
+  .sw.on{background:#34c759}
+  .sw.on::after{transform:translateX(20px)}
   ol.stp{padding-left:22px;margin:6px 0;font-size:13px;max-height:280px;overflow-y:auto}
   ol.stp li{margin-bottom:3px;line-height:1.4}
   ol.stp li button{padding:1px 7px;font-size:11px;margin:0 1px}
@@ -530,8 +533,20 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 
 <h1>ESP32 Remote HID</h1>
 
-<div id="rec" class="rec off" onclick="toggleRec()">⏺ Záznam VYPNUTÝ — klikni pre zapnutie</div>
-<div id="jig" class="jig" onclick="toggleJiggle()">🖱️ Mouse Jiggler VYPNUTÝ — klikni pre zapnutie</div>
+<div class="trow" onclick="toggleRec()">
+  <div>
+    <div class="trow-lbl">⏺ Záznam makra</div>
+    <div class="trow-sub">Kliky pridávajú kroky namiesto okamžitého vykonania</div>
+  </div>
+  <div id="recSw" class="sw"></div>
+</div>
+<div class="trow" onclick="toggleJiggle()">
+  <div>
+    <div class="trow-lbl">🖱️ Mouse Jiggler</div>
+    <div class="trow-sub">Pohybuje myšou každých 5 minút</div>
+  </div>
+  <div id="jigSw" class="sw"></div>
+</div>
 
 <div class="card">
   <h2>Klávesnica — text</h2>
@@ -641,14 +656,7 @@ async function api(p, b) {
 
 function toggleRec() {
   recording = !recording;
-  const b = document.getElementById('rec');
-  if (recording) {
-    b.classList.remove('off');
-    b.textContent = '⏺ Záznam ZAPNUTÝ — kliky pridávajú kroky';
-  } else {
-    b.classList.add('off');
-    b.textContent = '⏺ Záznam VYPNUTÝ — klikni pre zapnutie';
-  }
+  document.getElementById('recSw').classList.toggle('on', recording);
 }
 
 function rec(s) { steps.push(s); render(); }
@@ -821,25 +829,14 @@ async function toggleJiggle() {
   const r = await api('/api/jiggle', '');
   if (!r) return;
   const data = await r.json();
-  const el = document.getElementById('jig');
-  if (data.enabled) {
-    el.classList.add('on');
-    el.textContent = '🖱️ Mouse Jiggler ZAPNUTÝ — pohybuje každých 5 min';
-  } else {
-    el.classList.remove('on');
-    el.textContent = '🖱️ Mouse Jiggler VYPNUTÝ — klikni pre zapnutie';
-  }
+  document.getElementById('jigSw').classList.toggle('on', data.enabled);
 }
 
 async function initJiggler() {
   try {
     const r = await fetch('/api/jiggle/status');
     const data = await r.json();
-    const el = document.getElementById('jig');
-    if (data.enabled) {
-      el.classList.add('on');
-      el.textContent = '🖱️ Mouse Jiggler ZAPNUTÝ — pohybuje každých 5 min';
-    }
+    document.getElementById('jigSw').classList.toggle('on', data.enabled);
   } catch(e) {}
 }
 
