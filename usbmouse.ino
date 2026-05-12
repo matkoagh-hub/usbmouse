@@ -46,7 +46,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Zvýš pri každom release pushnutom na GitHub (semver "major.minor.patch")
-#define FIRMWARE_VERSION       "1.0.4"
+#define FIRMWARE_VERSION       "1.0.5"
 
 // GitHub repo odkiaľ sa sťahujú aktualizácie
 #define GITHUB_REPO            "matkoagh-hub/usbmouse"
@@ -539,6 +539,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   <div class="row">
     <button onclick="actText(false)">Odoslať</button>
     <button class="sec" onclick="actText(true)">Odoslať + Enter</button>
+    <button id="skBtn" class="sec" onclick="toggleSK()" title="Oprava číslic pre SK klávesnicu">SK</button>
   </div>
 </div>
 
@@ -615,6 +616,13 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   <div id="sv"></div>
 </div>
 
+<div class="card">
+  <div class="row" style="justify-content:space-between;align-items:center">
+    <span style="font-size:13px;color:#555">ESP32 Remote HID v1.0.5</span>
+    <button class="danger" onclick="reboot()">↺ Reboot / OTA update</button>
+  </div>
+</div>
+
 <div id="st">Pripravený</div>
 
 <script>
@@ -686,15 +694,50 @@ function addPause() {
   if (ms > 0) rec({a:'wait', ms});
 }
 
+// ── SK layout – čísla treba posielať ako Shift+číslica ───────────────────
+let skLayout = false;
+function toggleSK() {
+  skLayout = !skLayout;
+  const b = document.getElementById('skBtn');
+  b.style.background = skLayout ? '#007aff' : '';
+  b.style.color      = skLayout ? '#fff'    : '';
+  b.title = skLayout ? 'SK: čísla sa posielajú ako Shift+číslica' : 'Oprava číslic pre SK klávesnicu';
+}
+
+// Pošle text s SK opravou: digit → Shift+digit, zvyšok normálne
+async function sendTextSK(text) {
+  let seg = '';
+  for (const c of text) {
+    if (c >= '0' && c <= '9') {
+      if (seg) { await api('/api/type', seg); seg = ''; }
+      await api('/api/combo', 'shift,' + c);
+    } else { seg += c; }
+  }
+  if (seg) await api('/api/type', seg);
+}
+
 // ── Action dispatchers: recording → push step | normal → call API ─────────
 function actText(withEnter) {
   const t = document.getElementById('txt').value;
   if (!t) return;
   if (recording) {
-    rec({a:'type', t});
+    // V zázname: split na segmenty ak je SK mode
+    if (skLayout) {
+      let seg = '';
+      for (const c of t) {
+        if (c >= '0' && c <= '9') {
+          if (seg) { rec({a:'type', t:seg}); seg=''; }
+          rec({a:'combo', m:'shift', k:c});
+        } else { seg += c; }
+      }
+      if (seg) rec({a:'type', t:seg});
+    } else {
+      rec({a:'type', t});
+    }
     if (withEnter) rec({a:'key', k:'enter'});
   } else {
-    api('/api/type', t).then(()=>{ if(withEnter) api('/api/key','enter'); });
+    (skLayout ? sendTextSK(t) : api('/api/type', t))
+      .then(() => { if (withEnter) api('/api/key', 'enter'); });
   }
   document.getElementById('txt').value='';
 }
@@ -798,6 +841,19 @@ async function initJiggler() {
       el.textContent = '🖱️ Mouse Jiggler ZAPNUTÝ — pohybuje každých 5 min';
     }
   } catch(e) {}
+}
+
+// ── Reboot ────────────────────────────────────────────────────────────────
+async function reboot() {
+  if (!confirm('Rebootnúť ESP? (OTA aktualizácia sa spustí automaticky po štarte)')) return;
+  st.className = 'ok';
+  st.textContent = 'Rebootujem…';
+  try { await fetch('/api/reboot', {method:'POST'}); } catch(e) {}
+  // Po ~8 sekundách skús znova načítať stránku
+  setTimeout(() => {
+    st.textContent = 'Pokúšam sa znovu pripojiť…';
+    setTimeout(() => location.reload(), 3000);
+  }, 8000);
 }
 
 window.addEventListener('load', () => { refreshSaved(); initJiggler(); });
@@ -962,6 +1018,13 @@ void setupWebServer() {
     webServer.on("/api/jiggle/status", HTTP_GET, []() {
         webServer.send(200, "application/json",
                        jigglerEnabled ? "{\"enabled\":true}" : "{\"enabled\":false}");
+    });
+
+    // POST /api/reboot – reštartuje ESP (spustí OTA kontrolu po boote)
+    webServer.on("/api/reboot", HTTP_POST, []() {
+        webServer.send(200, "text/plain", "rebooting...");
+        delay(300);
+        ESP.restart();
     });
 
     // POST /api/macro/del    body: name
