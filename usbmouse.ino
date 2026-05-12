@@ -46,7 +46,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Zvýš pri každom release pushnutom na GitHub (semver "major.minor.patch")
-#define FIRMWARE_VERSION       "1.0.5"
+#define FIRMWARE_VERSION       "1.0.6"
 
 // GitHub repo odkiaľ sa sťahujú aktualizácie
 #define GITHUB_REPO            "matkoagh-hub/usbmouse"
@@ -1094,12 +1094,12 @@ void loop() {
     // Obsluha web requestov (musí byť volaná často)
     webServer.handleClient();
 
-    // Mouse jiggler – pohne myšou o 2 px doprava a späť, každých 5 minút
+    // Mouse jiggler – každých 5 minút pohne myšou tam a späť (20 px)
     if (jigglerEnabled && millis() - lastJiggle >= JIGGLE_INTERVAL_MS) {
         lastJiggle = millis();
-        mouse_move(2, 0);
-        delay(80);
-        mouse_move(-2, 0);
+        mouse_move(20, 10);
+        delay(300);
+        mouse_move(-20, -10);
         Serial.println("[Jiggle] pohyb");
     }
 
