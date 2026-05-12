@@ -36,6 +36,7 @@
 #include <WiFiManager.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <ESPmDNS.h>
 #include <USB.h>
 #include <USBHIDMouse.h>
 #include <USBHIDKeyboard.h>
@@ -45,7 +46,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Zvýš pri každom release pushnutom na GitHub (semver "major.minor.patch")
-#define FIRMWARE_VERSION       "1.0.3"
+#define FIRMWARE_VERSION       "1.0.4"
 
 // GitHub repo odkiaľ sa sťahujú aktualizácie
 #define GITHUB_REPO            "matkoagh-hub/usbmouse"
@@ -1008,8 +1009,16 @@ void setup() {
 
     startWiFiManager(false);
 
-    // Web UI – ovládanie HID cez prehliadač na IP adrese ESP
+    // Web UI – ovládanie HID cez prehliadač
     setupWebServer();
+
+    // mDNS – ESP bude dostupné na http://usbmouse.local
+    if (MDNS.begin("usbmouse")) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.println("[mDNS] Dostupné na http://usbmouse.local");
+    } else {
+        Serial.println("[mDNS] Inicializácia zlyhala");
+    }
 
     // Prvá OTA kontrola ihneď po štarte (spustí sa pri prvom prechode loop())
     lastOtaCheck = millis() - OTA_CHECK_INTERVAL_MS;
