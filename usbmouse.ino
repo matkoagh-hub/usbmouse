@@ -46,7 +46,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Zvýš pri každom release pushnutom na GitHub (semver "major.minor.patch")
-#define FIRMWARE_VERSION       "1.0.9"
+#define FIRMWARE_VERSION       "1.1.0"
 
 // GitHub repo odkiaľ sa sťahujú aktualizácie
 #define GITHUB_REPO            "matkoagh-hub/usbmouse"
@@ -545,6 +545,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   .sv{display:flex;align-items:center;padding:6px 0;border-bottom:1px solid #eee;gap:4px}
   .sv:last-child{border:none}
   .sv span{flex:1;font-size:14px}
+  .tp{background:#f5f5f7;border:2px dashed #d1d1d6;border-radius:12px;height:200px;display:flex;align-items:center;justify-content:center;font-size:13px;color:#8e8e93;cursor:crosshair;touch-action:none;user-select:none;text-align:center;line-height:1.6;transition:border-color .15s,background .15s}
+  .tp.drag{background:#e8f0fe;border-color:#007aff;color:#007aff}
 </style>
 </head>
 <body>
@@ -609,24 +611,42 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 
 <div class="card">
   <h2>Myš</h2>
-  <div class="pad">
-    <button class="sec empty"></button>
-    <button class="sec" onclick="actMoveStep(0,-1)">▲</button>
-    <button class="sec empty"></button>
-    <button class="sec" onclick="actMoveStep(-1,0)">◀</button>
-    <button onclick="actClick('left')">●</button>
-    <button class="sec" onclick="actMoveStep(1,0)">▶</button>
-    <button class="sec empty"></button>
-    <button class="sec" onclick="actMoveStep(0,1)">▼</button>
-    <button class="sec empty"></button>
+  <div class="row" style="margin-bottom:8px">
+    <button id="tabA" style="flex:1" onclick="setMouseMode('a')">🕹️ Šípky</button>
+    <button id="tabT" class="sec" style="flex:1" onclick="setMouseMode('t')">👆 Touchpad</button>
   </div>
-  <div style="margin:10px 0 6px;display:flex;align-items:center;gap:8px">
-    <span style="font-size:13px;color:#555;white-space:nowrap">Krok:</span>
-    <input id="stepSz" type="range" min="1" max="127" value="30"
-           style="flex:1;accent-color:#007aff" oninput="stepLabel.textContent=this.value+'px'">
-    <span id="stepLabel" style="font-size:13px;font-weight:600;min-width:38px">30px</span>
+
+  <div id="modeA">
+    <div class="pad">
+      <button class="sec empty"></button>
+      <button class="sec" onclick="actMoveStep(0,-1)">▲</button>
+      <button class="sec empty"></button>
+      <button class="sec" onclick="actMoveStep(-1,0)">◀</button>
+      <button onclick="actClick('left')">●</button>
+      <button class="sec" onclick="actMoveStep(1,0)">▶</button>
+      <button class="sec empty"></button>
+      <button class="sec" onclick="actMoveStep(0,1)">▼</button>
+      <button class="sec empty"></button>
+    </div>
+    <div style="margin:10px 0 4px;display:flex;align-items:center;gap:8px">
+      <span style="font-size:13px;color:#555;white-space:nowrap">Krok:</span>
+      <input id="stepSz" type="range" min="1" max="127" value="30"
+             style="flex:1;accent-color:#007aff" oninput="stepLabel.textContent=this.value+'px'">
+      <span id="stepLabel" style="font-size:13px;font-weight:600;min-width:38px">30px</span>
+    </div>
   </div>
-  <div class="row" style="justify-content:center;margin-top:4px">
+
+  <div id="modeT" style="display:none">
+    <div id="tp" class="tp">Ťahaj prstom pre pohyb myši<br>Rýchle ťuknutie = ľavý klik</div>
+    <div style="margin:10px 0 4px;display:flex;align-items:center;gap:8px">
+      <span style="font-size:13px;color:#555;white-space:nowrap">Citlivosť:</span>
+      <input id="tpSens" type="range" min="0.3" max="4" step="0.1" value="1.5"
+             style="flex:1;accent-color:#007aff" oninput="tpSensLbl.textContent=parseFloat(this.value).toFixed(1)+'x'">
+      <span id="tpSensLbl" style="font-size:13px;font-weight:600;min-width:38px">1.5x</span>
+    </div>
+  </div>
+
+  <div class="row" style="justify-content:center;margin-top:6px">
     <button class="sec" onclick="actClick('left')">Ľavý</button>
     <button class="sec" onclick="actClick('right')">Pravý</button>
     <button class="sec" onclick="actClick('middle')">Stred</button>
@@ -882,7 +902,90 @@ async function reboot() {
   }, 8000);
 }
 
-window.addEventListener('load', () => { refreshSaved(); initJiggler(); });
+// ── Touchpad ──────────────────────────────────────────────────────────────
+let tpActive = false;
+let tpLx = 0, tpLy = 0;          // last pointer position
+let tpAx = 0, tpAy = 0;          // accumulated sub-pixel delta
+let tpT0 = 0;                     // pointer-down timestamp (for tap detection)
+let tpStartX = 0, tpStartY = 0;  // pointer-down position (for tap detection)
+const TAP_MAX_MS  = 200;
+const TAP_MAX_PX  = 10;
+
+function tpSensitivity() {
+  return parseFloat(document.getElementById('tpSens').value) || 1.5;
+}
+
+function tpFlush() {
+  const ix = Math.trunc(tpAx);
+  const iy = Math.trunc(tpAy);
+  if (ix === 0 && iy === 0) return;
+  const clamped = v => Math.max(-127, Math.min(127, v));
+  actMove(clamped(ix), clamped(iy));
+  tpAx -= ix;
+  tpAy -= iy;
+}
+
+function tpStart(e) {
+  e.preventDefault();
+  const pt = e.touches ? e.touches[0] : e;
+  tpActive = true;
+  tpLx = pt.clientX; tpLy = pt.clientY;
+  tpStartX = pt.clientX; tpStartY = pt.clientY;
+  tpAx = 0; tpAy = 0;
+  tpT0 = Date.now();
+  document.getElementById('tp').classList.add('drag');
+}
+
+function tpMove(e) {
+  e.preventDefault();
+  if (!tpActive) return;
+  const pt = e.touches ? e.touches[0] : e;
+  const dx = (pt.clientX - tpLx) * tpSensitivity();
+  const dy = (pt.clientY - tpLy) * tpSensitivity();
+  tpLx = pt.clientX; tpLy = pt.clientY;
+  tpAx += dx; tpAy += dy;
+  tpFlush();
+}
+
+function tpEnd(e) {
+  e.preventDefault();
+  document.getElementById('tp').classList.remove('drag');
+  if (!tpActive) return;
+  tpActive = false;
+  tpFlush();
+  // Tap-to-click: short, stationary touch
+  const dt = Date.now() - tpT0;
+  const dist = Math.hypot(
+    (e.changedTouches ? e.changedTouches[0].clientX : e.clientX) - tpStartX,
+    (e.changedTouches ? e.changedTouches[0].clientY : e.clientY) - tpStartY
+  );
+  if (dt < TAP_MAX_MS && dist < TAP_MAX_PX) {
+    actClick('left');
+  }
+}
+
+function setMouseMode(m) {
+  const isT = m === 't';
+  document.getElementById('modeA').style.display = isT ? 'none' : '';
+  document.getElementById('modeT').style.display = isT ? '' : 'none';
+  document.getElementById('tabA').classList.toggle('sec',  isT);
+  document.getElementById('tabT').classList.toggle('sec', !isT);
+}
+
+function setupTouchpad() {
+  const tp = document.getElementById('tp');
+  // Touch events
+  tp.addEventListener('touchstart', tpStart, {passive: false});
+  tp.addEventListener('touchmove',  tpMove,  {passive: false});
+  tp.addEventListener('touchend',   tpEnd,   {passive: false});
+  // Mouse events (desktop testing)
+  tp.addEventListener('mousedown', tpStart);
+  tp.addEventListener('mousemove', e => { if (e.buttons) tpMove(e); });
+  tp.addEventListener('mouseup',   tpEnd);
+  tp.addEventListener('mouseleave', e => { if (tpActive) tpEnd(e); });
+}
+
+window.addEventListener('load', () => { refreshSaved(); initJiggler(); setupTouchpad(); });
 </script>
 </body>
 </html>)HTML";
