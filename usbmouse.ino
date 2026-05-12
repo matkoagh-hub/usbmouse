@@ -46,7 +46,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Zvýš pri každom release pushnutom na GitHub (semver "major.minor.patch")
-#define FIRMWARE_VERSION       "1.0.8"
+#define FIRMWARE_VERSION       "1.0.9"
 
 // GitHub repo odkiaľ sa sťahujú aktualizácie
 #define GITHUB_REPO            "matkoagh-hub/usbmouse"
@@ -611,16 +611,22 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   <h2>Myš</h2>
   <div class="pad">
     <button class="sec empty"></button>
-    <button class="sec" onclick="actMove(0,-30)">▲</button>
+    <button class="sec" onclick="actMoveStep(0,-1)">▲</button>
     <button class="sec empty"></button>
-    <button class="sec" onclick="actMove(-30,0)">◀</button>
+    <button class="sec" onclick="actMoveStep(-1,0)">◀</button>
     <button onclick="actClick('left')">●</button>
-    <button class="sec" onclick="actMove(30,0)">▶</button>
+    <button class="sec" onclick="actMoveStep(1,0)">▶</button>
     <button class="sec empty"></button>
-    <button class="sec" onclick="actMove(0,30)">▼</button>
+    <button class="sec" onclick="actMoveStep(0,1)">▼</button>
     <button class="sec empty"></button>
   </div>
-  <div class="row" style="justify-content:center;margin-top:6px">
+  <div style="margin:10px 0 6px;display:flex;align-items:center;gap:8px">
+    <span style="font-size:13px;color:#555;white-space:nowrap">Krok:</span>
+    <input id="stepSz" type="range" min="1" max="127" value="30"
+           style="flex:1;accent-color:#007aff" oninput="stepLabel.textContent=this.value+'px'">
+    <span id="stepLabel" style="font-size:13px;font-weight:600;min-width:38px">30px</span>
+  </div>
+  <div class="row" style="justify-content:center;margin-top:4px">
     <button class="sec" onclick="actClick('left')">Ľavý</button>
     <button class="sec" onclick="actClick('right')">Pravý</button>
     <button class="sec" onclick="actClick('middle')">Stred</button>
@@ -775,6 +781,10 @@ document.getElementById('txt').addEventListener('keydown', e=>{
 function actKey(k)        { recording ? rec({a:'key', k})       : api('/api/key', k); }
 function actCombo(m, k)   { recording ? rec({a:'combo', m, k})  : api('/api/combo', m+','+k); }
 function actMove(x, y)    { recording ? rec({a:'move', x, y})   : api('/api/move', x+','+y); }
+function actMoveStep(dx, dy) {
+  const s = parseInt(document.getElementById('stepSz').value) || 30;
+  actMove(dx * s, dy * s);
+}
 function actClick(b)      { recording ? rec({a:'click', b})     : api('/api/click', b); }
 function actScroll(d)     { recording ? rec({a:'scroll', d})    : api('/api/scroll', String(d)); }
 
