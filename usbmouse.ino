@@ -658,7 +658,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 
 <div class="card">
   <div class="row" style="justify-content:space-between;align-items:center">
-    <span style="font-size:13px;color:#555">ESP32 Remote HID v1.0.5</span>
+    <span style="font-size:13px;color:#555">ESP32 Remote HID v)HTML" FIRMWARE_VERSION R"HTML(</span>
     <button class="danger" onclick="reboot()">↺ Reboot / OTA update</button>
   </div>
 </div>
